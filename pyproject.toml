@@ -1,0 +1,35 @@
+[project]
+name = "memobot-mcp"
+version = "0.1.0"
+description = "Unofficial MCP server for Memobot, with browser-based login capture"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Kyle", email = "tinhvqbk@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp>=1.28.1",
+    "playwright>=1.61.0",
+]
+
+[project.scripts]
+memobot = "memobot_mcp:main"
+
+[build-system]
+requires = ["uv_build>=0.11.1,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.15.21",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
