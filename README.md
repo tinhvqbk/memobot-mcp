@@ -36,6 +36,14 @@ browser (Safari, Firefox, whatever), anywhere — using SSH port-forwarding if t
 isn't local. Set `MEMOBOT_MCP_HEADLESS=1` to force this path even on a machine that does
 have a display.
 
+That local-callback path never blocks a tool call for long: it polls briefly (a few
+seconds) and, if nobody's logged in yet, fails fast with the login URL *in the tool
+error's own message* — not just printed to stderr, since some MCP clients (agentic ones
+especially, e.g. OpenClaw) don't show a server's stderr and/or kill tool calls that block
+too long, which otherwise means the link never actually reaches the user. The server keeps
+listening in the background, so simply retrying the same tool call after logging in picks
+up the already-captured token immediately instead of starting over.
+
 ## Run standalone
 
 ```bash
