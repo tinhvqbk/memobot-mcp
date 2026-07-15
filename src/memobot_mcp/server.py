@@ -1,7 +1,10 @@
 import json
+import sys
+import threading
 
 from mcp.server.fastmcp import FastMCP
 
+from . import updates
 from .client import MemobotClient
 
 mcp = FastMCP("memobot-mcp")
@@ -99,6 +102,16 @@ def get_notifications(max_result: int = 10) -> str:
     return _json(client.get_notifications(max_result=max_result))
 
 
+@mcp.tool()
+def check_for_updates() -> str:
+    """Checks whether a newer memobot-mcp version exists on GitHub's main
+    branch than the one this running server was built from. Since this
+    server runs via `uvx --from git+...`, restarting/reconnecting your MCP
+    client is all that's needed to pick up an update — uvx always resolves
+    the latest commit on a fresh launch."""
+    return _json(updates.check_for_updates())
+
+
 # Prompts are what Claude Code surfaces as slash commands
 # (`/mcp__memobot__<name>`) — tools alone are only ever called implicitly by
 # the model. Each one just runs the matching tool and drops its JSON straight
@@ -166,7 +179,34 @@ def prompt_get_notifications() -> str:
     return get_notifications()
 
 
+@mcp.prompt(name="check_for_updates")
+def prompt_check_for_updates() -> str:
+    """Check whether a newer memobot-mcp version is available."""
+    return check_for_updates()
+
+
+def _warn_if_outdated():
+    """Best-effort startup notice: a long-running session keeps its process
+    alive even after `main` moves on, with no way to notice on its own. This
+    check is silent on any failure (offline, GitHub down, etc.) — it must
+    never block or break server startup."""
+    try:
+        result = updates.check_for_updates()
+    except Exception:
+        return
+    if result.get("update_available"):
+        print(
+            f"\nmemobot-mcp update available: {result['running_version']} -> "
+            f"{result['latest_version']}. Restart/reconnect your MCP client to "
+            "pick it up (uvx always fetches the latest commit on a fresh launch).\n",
+            file=sys.stderr,
+        )
+
+
 def main():
+    # Backgrounded so a slow/offline network check never delays startup —
+    # some MCP clients already have tight startup timeouts (see README).
+    threading.Thread(target=_warn_if_outdated, daemon=True).start()
     mcp.run()
 
 

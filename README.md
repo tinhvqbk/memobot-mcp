@@ -122,6 +122,18 @@ later launch by any client starts near-instantly.
 - `get_user_config` — account-level feature flags/config
 - `get_api_key` — the account's ASR/TTS API key and quota
 - `get_notifications` — recent in-app notifications
+- `check_for_updates` — whether a newer memobot-mcp version exists on GitHub
+
+## Updates
+
+There's no package registry here — `uvx --from git+...` re-resolves and rebuilds against
+the latest commit on `main` on every fresh process launch (verified: `uv` queries GitHub's
+API for the current HEAD commit each time). So restarting/reconnecting your MCP client
+already gets you the latest code for free; there's no separate "update" step. The gap is
+just *noticing* that's worth doing, since a long-running session keeps its already-started
+process alive even after `main` moves on. The server checks once in the background at
+startup and prints a note to stderr if it's outdated, and `check_for_updates` (tool or
+`/mcp__memobot__check_for_updates` prompt) does the same check on demand.
 
 ## Known gaps
 

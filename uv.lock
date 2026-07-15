@@ -418,11 +418,12 @@ wheels = [
 
 [[package]]
 name = "memobot-mcp"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
     { name = "mcp" },
+    { name = "packaging" },
     { name = "playwright" },
 ]
 
@@ -436,6 +437,7 @@ dev = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "mcp", specifier = ">=1.28.1" },
+    { name = "packaging", specifier = ">=26.2" },
     { name = "playwright", specifier = ">=1.61.0" },
 ]
 
