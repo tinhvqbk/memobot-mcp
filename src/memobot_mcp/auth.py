@@ -1,21 +1,20 @@
 """Browser-based login for Memobot.
 
-Memobot has no OAuth/device-code flow. On a machine with a display, we pop a
-real Chromium window at the login page and wait for the user to sign in by
-hand (email/password or Google/Facebook/Apple button) — we never see or
-store the password ourselves, just sniff the JSON response of the login XHR
-the app itself fires.
-
-On a headless machine (no GUI to show Chromium on — e.g. a server reached
-over plain SSH), we instead start a tiny local HTTP server and print a URL
-for the user to open in *any* browser, anywhere (their own laptop/phone, via
-SSH port-forwarding if the server isn't local). That page's JS calls
-Memobot's login endpoint directly from the user's browser — the password
+Memobot has no OAuth/device-code flow, so instead we run a tiny local HTTP
+server that serves a login page and print/open its URL. That page's JS calls
+Memobot's login endpoint directly from the user's own browser — the password
 goes straight from their browser to Memobot's real server (CORS on that
-endpoint is wide open, so this works), never through our process — and once
-Memobot responds, the page POSTs just the resulting token JSON back to our
-local server. Either way, the token is cached to disk and reused for its
-~1 year validity.
+endpoint is wide open, so this works) and never touches our process — and
+once Memobot responds, the page POSTs just the resulting token JSON back to
+our local server. The token is then cached to disk and reused for its ~1
+year validity.
+
+When a display is available we open that URL automatically in the system's
+default browser (whatever's already installed — Chrome, Safari, Firefox...);
+there's no bundled/downloaded browser to install or launch. On a headless
+machine (no GUI — e.g. a server reached over plain SSH) we just print the
+URL for the user to open in any browser, anywhere, using SSH port-forwarding
+if the server isn't local.
 
 Once expired, we first try a silent refresh via the cached refresh_token
 (POST /authen/api/v1/auth/token) before falling back to another interactive
@@ -26,19 +25,16 @@ itself no longer works (e.g. the password was changed).
 import json
 import os
 import stat
-import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
-from playwright.sync_api import sync_playwright
 
-LOGIN_URL = "https://app.memobot.io/dang-nhap"
 LOGIN_ENDPOINT = "https://sohoa.memobot.io/authen/api/v1/auth/login"
-LOGIN_ENDPOINT_SUFFIX = "/authen/api/v1/auth/login"
 REFRESH_URL = "https://sohoa.memobot.io/authen/api/v1/auth/token"
 CREDENTIALS_PATH = Path.home() / ".config" / "memobot-mcp" / "credentials.json"
 
@@ -66,9 +62,10 @@ def _load_cached_token():
 
 def _refresh_access_token(refresh_token):
     """Silently exchanges a still-valid refresh_token for a new access_token,
-    avoiding a browser popup. The response only carries access_token/expire_at/
-    expire_after — refresh_token and user_id don't rotate, so callers must
-    merge this into the previously cached data rather than replace it."""
+    avoiding an interactive login. The response only carries access_token/
+    expire_at/expire_after — refresh_token and user_id don't rotate, so
+    callers must merge this into the previously cached data rather than
+    replace it."""
     response = httpx.post(REFRESH_URL, json={"refresh_token": refresh_token})
     response.raise_for_status()
     return response.json()
@@ -81,12 +78,12 @@ def _save_token(data):
 
 
 def _has_display():
-    """Best-effort check for whether we can pop a real browser window here.
-    MEMOBOT_MCP_HEADLESS=1 forces the local-callback path regardless of
-    platform (e.g. a macOS box that's technically "darwin" but has no real
+    """Best-effort check for whether we can auto-open a browser here.
+    MEMOBOT_MCP_HEADLESS=1 forces manual mode (just print the URL) regardless
+    of platform (e.g. a macOS box that's technically "darwin" but has no real
     interactive session). Otherwise macOS/Windows are assumed to always have
-    a display; on Linux/X11/Wayland we check the usual env vars a headless
-    SSH session won't have set."""
+    one; on Linux/X11/Wayland we check the usual env vars a headless SSH
+    session won't have set."""
     if os.environ.get("MEMOBOT_MCP_HEADLESS"):
         return False
     if sys.platform in ("darwin", "win32"):
@@ -195,12 +192,13 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         pass  # keep stderr clean — this isn't a debugging server
 
 
-def _local_callback_login(timeout_seconds=600, host="127.0.0.1", _on_ready=None):
+def _interactive_login(timeout_seconds=600, host="127.0.0.1", _on_ready=None):
     """Starts a throwaway local HTTP server serving a login page, and waits
-    for it to receive the resulting token via its /callback endpoint. Used
-    when there's no display to pop a real browser on (or the attempt to do
-    so failed) — the user opens the printed URL in any browser on any
-    device, using SSH port-forwarding if this host isn't their own.
+    for it to receive the resulting token via its /callback endpoint. Opens
+    the page automatically in the system's default browser when a display
+    is available; otherwise (or if that fails) just prints the URL for the
+    user to open in any browser, anywhere — using SSH port-forwarding if
+    this host isn't their own.
 
     _on_ready, if given, is called with the server's URL as soon as it's
     listening — a test-only hook, since the port is chosen dynamically."""
@@ -216,12 +214,17 @@ def _local_callback_login(timeout_seconds=600, host="127.0.0.1", _on_ready=None)
     url = f"http://{host}:{port}/"
     if _on_ready:
         _on_ready(url)
-    print("\nMemobot login needed — no display available here.", file=sys.stderr)
-    print(
-        "Open this URL in any browser (use SSH port-forwarding if this host is remote):",
-        file=sys.stderr,
-    )
-    print(f"\n    {url}\n", file=sys.stderr)
+
+    opened = _has_display() and webbrowser.open(url)
+    if opened:
+        print(f"\nOpened {url} in your browser to log in to Memobot.", file=sys.stderr)
+    else:
+        print("\nMemobot login needed.", file=sys.stderr)
+        print(
+            "Open this URL in any browser (use SSH port-forwarding if this host is remote):",
+            file=sys.stderr,
+        )
+        print(f"\n    {url}\n", file=sys.stderr)
 
     try:
         if not event.wait(timeout=timeout_seconds):
@@ -233,66 +236,6 @@ def _local_callback_login(timeout_seconds=600, host="127.0.0.1", _on_ready=None)
         thread.join(timeout=5)
 
     return server.captured_data
-
-
-def _interactive_login(timeout_seconds=300):
-    """Logs in interactively: pops a real headed browser when a display is
-    available, falling back to a local-callback login page (print a URL,
-    open it in any browser anywhere) if there's no display or the browser
-    attempt fails for any reason."""
-    if _has_display():
-        try:
-            return _browser_login(timeout_seconds=timeout_seconds)
-        except Exception as e:
-            print(
-                f"Headed browser login failed ({e}); falling back to a login link.",
-                file=sys.stderr,
-            )
-    return _local_callback_login()
-
-
-def _launch_chromium(playwright):
-    """Launches Chromium, installing the browser binary on first use if it's
-    missing — so a fresh `uvx` install works with no separate setup step."""
-    try:
-        return playwright.chromium.launch(headless=False)
-    except Exception as e:
-        if "Executable doesn't exist" not in str(e):
-            raise
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-        return playwright.chromium.launch(headless=False)
-
-
-def _browser_login(timeout_seconds=300):
-    """Open a real browser at the login page and wait for the app's own
-    login response, capturing it directly instead of touching credentials."""
-    captured = {}
-
-    with sync_playwright() as playwright:
-        browser = _launch_chromium(playwright)
-        page = browser.new_page()
-
-        def on_response(response):
-            if response.request.method == "POST" and response.url.endswith(LOGIN_ENDPOINT_SUFFIX):
-                try:
-                    captured["data"] = response.json()
-                except Exception:
-                    pass
-
-        page.on("response", on_response)
-        page.goto(LOGIN_URL)
-
-        deadline = time.time() + timeout_seconds
-        while "data" not in captured and time.time() < deadline:
-            page.wait_for_timeout(500)
-
-        browser.close()
-
-    if "data" not in captured:
-        raise TimeoutError(
-            f"Timed out waiting for Memobot login in the browser after {timeout_seconds}s"
-        )
-    return captured["data"]
 
 
 def _refresh_or_relogin():
@@ -322,10 +265,11 @@ def get_access_token(invalidate_cache=False):
     """Returns a valid Memobot access token.
 
     Prefers, in order: the cached access token; a silent refresh via the
-    cached refresh_token; an interactive login (headed browser, or a local
-    login link on headless machines). That interactive step only happens
-    when there's no usable cache at all or the refresh_token itself has
-    expired/been revoked (e.g. after a password change).
+    cached refresh_token; an interactive login (a local login page, opened
+    automatically in the system browser when possible). That interactive
+    step only happens when there's no usable cache at all or the
+    refresh_token itself has expired/been revoked (e.g. after a password
+    change).
 
     Pass invalidate_cache=True when the caller already knows the cached
     access token was rejected (e.g. an API call got a 401) — this skips

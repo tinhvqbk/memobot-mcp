@@ -165,45 +165,45 @@ def test_has_display_on_linux_depends_on_env_vars(monkeypatch):
     assert auth._has_display() is True
 
 
-def test_interactive_login_uses_browser_when_display_available(monkeypatch):
+def test_interactive_login_opens_system_browser_when_display_available(monkeypatch):
     monkeypatch.setattr(auth, "_has_display", lambda: True)
-    monkeypatch.setattr(auth, "_browser_login", lambda timeout_seconds=300: {"access_token": "b"})
+    opened = {}
+    monkeypatch.setattr(auth.webbrowser, "open", lambda url: opened.setdefault("url", url) or True)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError(
-            "_local_callback_login should not be called when browser login succeeds"
-        )
+    ready = threading.Event()
 
-    monkeypatch.setattr(auth, "_local_callback_login", fail_if_called)
+    def on_ready(url):
+        ready.set()
 
-    assert auth._interactive_login() == {"access_token": "b"}
+    result = {}
+
+    def run():
+        result["data"] = auth._interactive_login(timeout_seconds=10, _on_ready=on_ready)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert ready.wait(timeout=5), "server never became ready"
+    assert opened["url"].startswith("http://127.0.0.1:")
+
+    fake_login_response = {
+        "access_token": "x",
+        "refresh_token": "y",
+        "expire_at": 1,
+        "expire_after": 2,
+    }
+    httpx.post(opened["url"] + "callback", json=fake_login_response)
+    thread.join(timeout=5)
+    assert result["data"] == fake_login_response
 
 
-def test_interactive_login_skips_browser_when_no_display(monkeypatch):
+def test_interactive_login_does_not_open_browser_when_no_display(monkeypatch):
     monkeypatch.setattr(auth, "_has_display", lambda: False)
 
-    def fail_if_called(timeout_seconds=300):
-        raise AssertionError("_browser_login should not be called when there's no display")
+    def fail_if_called(url):
+        raise AssertionError("webbrowser.open should not be called with no display")
 
-    monkeypatch.setattr(auth, "_browser_login", fail_if_called)
-    monkeypatch.setattr(auth, "_local_callback_login", lambda: {"access_token": "c"})
+    monkeypatch.setattr(auth.webbrowser, "open", fail_if_called)
 
-    assert auth._interactive_login() == {"access_token": "c"}
-
-
-def test_interactive_login_falls_back_when_browser_login_raises(monkeypatch):
-    monkeypatch.setattr(auth, "_has_display", lambda: True)
-
-    def browser_fails(timeout_seconds=300):
-        raise RuntimeError("no working X server")
-
-    monkeypatch.setattr(auth, "_browser_login", browser_fails)
-    monkeypatch.setattr(auth, "_local_callback_login", lambda: {"access_token": "d"})
-
-    assert auth._interactive_login() == {"access_token": "d"}
-
-
-def test_local_callback_login_serves_page_and_captures_posted_token():
     ready = threading.Event()
     ready_url = {}
 
@@ -214,7 +214,38 @@ def test_local_callback_login_serves_page_and_captures_posted_token():
     result = {}
 
     def run():
-        result["data"] = auth._local_callback_login(timeout_seconds=10, _on_ready=on_ready)
+        result["data"] = auth._interactive_login(timeout_seconds=10, _on_ready=on_ready)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert ready.wait(timeout=5), "server never became ready"
+    url = ready_url["url"]
+
+    fake_login_response = {
+        "access_token": "z",
+        "refresh_token": "y",
+        "expire_at": 1,
+        "expire_after": 2,
+    }
+    httpx.post(url + "callback", json=fake_login_response)
+    thread.join(timeout=5)
+    assert result["data"] == fake_login_response
+
+
+def test_interactive_login_serves_page_and_captures_posted_token(monkeypatch):
+    monkeypatch.setattr(auth, "_has_display", lambda: False)
+
+    ready = threading.Event()
+    ready_url = {}
+
+    def on_ready(url):
+        ready_url["url"] = url
+        ready.set()
+
+    result = {}
+
+    def run():
+        result["data"] = auth._interactive_login(timeout_seconds=10, _on_ready=on_ready)
 
     thread = threading.Thread(target=run)
     thread.start()
