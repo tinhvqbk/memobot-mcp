@@ -9,15 +9,32 @@ names, and the token scheme may change or break without notice.
 
 ## Auth model
 
-No password ever touches this codebase. The first time a tool needs a token and none is
-cached, it pops a real Chromium window at Memobot's login page and waits for you to sign
-in by hand (email/password, or the Google/Facebook/Apple buttons) — it just listens for
-the app's own login response and reads the token out of it. That token is cached to
-`~/.config/memobot-mcp/credentials.json` (0600 permissions) and reused for its ~1 year
-validity. When it expires (or an API call gets a 401), the server first tries a silent
-refresh via the cached refresh_token (`POST /authen/api/v1/auth/token`) — the browser only
-pops up again if there's no cache at all or the refresh_token itself has been revoked
-(e.g. after a password change).
+No password ever touches this codebase, and nothing is downloaded automatically. The
+first time a tool needs a token and none is cached, and a display is available, it pops a
+real browser at Memobot's actual login page (`app.memobot.io`) and waits for you to sign
+in by hand — it just sniffs the JSON response of the login request the app itself fires.
+It drives whatever Chromium-family browser is already installed (Chrome, Edge, or Cốc
+Cốc) rather than downloading anything; if none of those are found, it falls back to a
+local login page instead of downloading (see below). Set
+`MEMOBOT_MCP_ALLOW_BROWSER_DOWNLOAD=1` if you'd rather it download and use Playwright's
+own bundled Chromium than fall back — useful if you want the real-domain experience but
+don't have Chrome/Edge/Cốc Cốc installed.
+
+That resulting token is cached to `~/.config/memobot-mcp/credentials.json` (0600
+permissions) and reused for its ~1 year validity. When it expires (or an API call gets a
+401), the server first tries a silent refresh via the cached refresh_token (`POST
+/authen/api/v1/auth/token`) — the interactive step only reappears if there's no cache at
+all or the refresh_token itself has been revoked (e.g. after a password change).
+
+On a machine with no display (a server reached over plain SSH), or if the real-domain
+browser attempt fails or is skipped, it instead starts a throwaway local HTTP server and
+opens (or, with no display, just prints the URL for you to open) a login page — not the
+real Memobot domain, but it submits straight to Memobot's real login endpoint from your
+browser (its CORS is wide open, so this works) and posts just the resulting token back to
+the local server; the password still never touches this codebase. Works with literally any
+browser (Safari, Firefox, whatever), anywhere — using SSH port-forwarding if the server
+isn't local. Set `MEMOBOT_MCP_HEADLESS=1` to force this path even on a machine that does
+have a display.
 
 ## Run standalone
 
@@ -125,9 +142,10 @@ File-upload and "join meeting" flows are unobserved and unimplemented.
 uv sync --all-groups   # install runtime + dev dependencies
 uv run ruff check .    # lint
 uv run ruff format .   # format
-uv run pytest -q       # unit tests (mocked — no real network or browser calls)
+uv run pytest -q       # unit tests (mocked Memobot API — no external network/browser calls)
 ```
 
 CI runs lint, format-check, and tests on every push/PR to `main`. There's intentionally no
-CI job that exercises the real Memobot API or the browser-login flow — that needs a real
-account and a display, neither of which CI has.
+CI job that exercises the real Memobot API — that needs a real account. The login flow
+itself (its HTTP server, page, and token capture, with/without auto-opening a browser) is
+tested for real, just against a fake token instead of a real Memobot login.
