@@ -25,8 +25,15 @@ port-forwarding if the server isn't local) — Safari, Firefox, whatever's
 available, no automation needed. That page's JS calls Memobot's login
 endpoint directly from the user's browser — same no-password-touches-us
 guarantee, since Memobot's CORS is wide open — and posts just the resulting
-token back to our local server. Either way, the token is cached to disk and
-reused for its ~1 year validity.
+token back to our local server. That local server doesn't block a tool call
+for long waiting on it: it polls briefly, then raises LoginPendingError
+whose *message* carries the URL, since that's what actually reaches the
+user through an MCP tool result — many clients (agentic ones especially)
+don't surface a server's stderr and/or kill tool calls that block too
+long. The server keeps running in the background, so retrying the same
+tool call after logging in picks up the already-captured token instead of
+starting over. Either way — headed browser or local callback — the token
+is cached to disk and reused for its ~1 year validity.
 
 Once expired, we first try a silent refresh via the cached refresh_token
 (POST /authen/api/v1/auth/token) before falling back to another interactive
@@ -323,18 +330,33 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         pass  # keep stderr clean — this isn't a debugging server
 
 
-def _local_callback_login(timeout_seconds=600, host="127.0.0.1", _on_ready=None):
-    """Starts a throwaway local HTTP server serving a login page (not the
-    real Memobot domain — see module docstring for why), and waits for it to
-    receive the resulting token via its /callback endpoint. Used when there's
-    no display to pop a real browser on, or the attempt to do so failed.
-    Opens the page automatically in the system's default browser when a
-    display is available; otherwise just prints the URL for the user to
-    open in any browser, anywhere — using SSH port-forwarding if this host
-    isn't their own.
+class LoginPendingError(Exception):
+    """Raised when a local-callback login was started (or was already in
+    progress) but hasn't completed yet. Its message carries the login URL —
+    unlike a stderr print, an exception's message is what MCP tool callers
+    (Claude Code, OpenClaw, etc.) actually surface back to the user, so this
+    is what makes the link visible even when a client doesn't show server
+    stderr and/or kills tool calls that block too long. The server keeps
+    running in the background: retry the same tool call after logging in
+    and it picks up the already-captured token instead of starting over."""
 
-    _on_ready, if given, is called with the server's URL as soon as it's
-    listening — a test-only hook, since the port is chosen dynamically."""
+    def __init__(self, url):
+        self.url = url
+        super().__init__(
+            f"Memobot login needed. Open this URL in any browser, anywhere (use SSH "
+            f"port-forwarding if this host is remote), then retry: {url}"
+        )
+
+
+# Local-callback server state, kept alive across calls (and across the short
+# poll inside a single call) so a client that can't afford to block a tool
+# call for long still gets the login completed on a later retry instead of
+# restarting the whole flow from scratch.
+_pending_lock = threading.Lock()
+_pending = {"server": None, "thread": None, "url": None}
+
+
+def _start_pending_server(host="127.0.0.1"):
     event = threading.Event()
     server = ThreadingHTTPServer((host, 0), _CallbackHandler)
     server.captured_event = event
@@ -345,30 +367,70 @@ def _local_callback_login(timeout_seconds=600, host="127.0.0.1", _on_ready=None)
 
     port = server.server_address[1]
     url = f"http://{host}:{port}/"
-    if _on_ready:
-        _on_ready(url)
+    _pending["server"] = server
+    _pending["thread"] = thread
+    _pending["url"] = url
+    return url
 
-    opened = _has_display() and webbrowser.open(url)
-    if opened:
-        print(f"\nOpened {url} in your browser to log in to Memobot.", file=sys.stderr)
-    else:
-        print("\nMemobot login needed.", file=sys.stderr)
-        print(
-            "Open this URL in any browser (use SSH port-forwarding if this host is remote):",
-            file=sys.stderr,
-        )
-        print(f"\n    {url}\n", file=sys.stderr)
 
-    try:
-        if not event.wait(timeout=timeout_seconds):
-            raise TimeoutError(
-                f"Timed out waiting for Memobot login via {url} after {timeout_seconds}s"
-            )
-    finally:
+def _clear_pending():
+    server = _pending["server"]
+    thread = _pending["thread"]
+    _pending["server"] = None
+    _pending["thread"] = None
+    _pending["url"] = None
+    if server:
         server.shutdown()
+    if thread:
         thread.join(timeout=5)
 
-    return server.captured_data
+
+def _local_callback_login(poll_seconds=8, host="127.0.0.1", _on_ready=None):
+    """Starts (or reuses an already-running) throwaway local HTTP server
+    serving a login page — not the real Memobot domain, see module
+    docstring for why — and waits up to poll_seconds for it to receive the
+    token via its /callback endpoint. Used when there's no display to pop a
+    real browser on, or the attempt to do so failed.
+
+    Rather than blocking for a long time in one call (which many MCP
+    clients won't tolerate — some kill slow tool calls, some never show the
+    server's stderr at all), this only waits briefly and then raises
+    LoginPendingError with the URL in its message, so it's visible in the
+    tool result itself. The server keeps running in the background:
+    calling this again (e.g. the caller retries the tool) reuses it and
+    returns the captured token immediately if login has since completed.
+
+    _on_ready, if given, is called with the server's URL as soon as it's
+    known — a test-only hook, since the port is chosen dynamically."""
+    with _pending_lock:
+        server = _pending["server"]
+        if server is None:
+            url = _start_pending_server(host=host)
+            server = _pending["server"]
+            if _on_ready:
+                _on_ready(url)
+
+            opened = _has_display() and webbrowser.open(url)
+            if opened:
+                print(f"\nOpened {url} in your browser to log in to Memobot.", file=sys.stderr)
+            else:
+                print("\nMemobot login needed.", file=sys.stderr)
+                print(
+                    "Open this URL in any browser (use SSH port-forwarding if this "
+                    "host is remote):",
+                    file=sys.stderr,
+                )
+                print(f"\n    {url}\n", file=sys.stderr)
+        else:
+            url = _pending["url"]
+
+    if server.captured_event.wait(timeout=poll_seconds):
+        with _pending_lock:
+            data = server.captured_data
+            _clear_pending()
+        return data
+
+    raise LoginPendingError(url)
 
 
 def _interactive_login(timeout_seconds=300):

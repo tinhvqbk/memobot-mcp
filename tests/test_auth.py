@@ -14,6 +14,15 @@ def isolated_credentials_path(tmp_path, monkeypatch):
     return auth.CREDENTIALS_PATH
 
 
+@pytest.fixture(autouse=True)
+def reset_pending_login():
+    # _pending is module-level state shared across calls by design (so a
+    # retry can reuse an in-flight login server) — tests must not leak it.
+    yield
+    if auth._pending["server"] is not None:
+        auth._clear_pending()
+
+
 def _token(expire_at):
     return {
         "access_token": "access-jwt",
@@ -110,6 +119,16 @@ def test_get_access_token_invalidate_cache_falls_back_to_interactive_when_refres
     monkeypatch.setattr(auth, "_interactive_login", lambda: fresh)
 
     assert auth.get_access_token(invalidate_cache=True) == "fresh-jwt"
+
+
+def test_get_access_token_propagates_login_pending_error(monkeypatch):
+    def raises_pending():
+        raise auth.LoginPendingError("http://127.0.0.1:12345/")
+
+    monkeypatch.setattr(auth, "_interactive_login", raises_pending)
+
+    with pytest.raises(auth.LoginPendingError, match="http://127.0.0.1:12345/"):
+        auth.get_access_token()
 
 
 def test_refresh_access_token_posts_refresh_token_and_returns_json(monkeypatch):
@@ -322,7 +341,7 @@ def test_local_callback_login_opens_system_browser_when_display_available(monkey
     result = {}
 
     def run():
-        result["data"] = auth._local_callback_login(timeout_seconds=10, _on_ready=on_ready)
+        result["data"] = auth._local_callback_login(poll_seconds=10, _on_ready=on_ready)
 
     thread = threading.Thread(target=run)
     thread.start()
@@ -353,7 +372,7 @@ def test_local_callback_login_serves_page_and_captures_posted_token(monkeypatch)
     result = {}
 
     def run():
-        result["data"] = auth._local_callback_login(timeout_seconds=10, _on_ready=on_ready)
+        result["data"] = auth._local_callback_login(poll_seconds=10, _on_ready=on_ready)
 
     thread = threading.Thread(target=run)
     thread.start()
@@ -379,3 +398,41 @@ def test_local_callback_login_serves_page_and_captures_posted_token(monkeypatch)
 
     thread.join(timeout=5)
     assert result["data"] == fake_login_response
+
+
+def test_local_callback_login_raises_pending_error_quickly_when_nobody_logs_in(monkeypatch):
+    monkeypatch.setattr(auth, "_has_display", lambda: False)
+
+    start = auth.time.time()
+    with pytest.raises(auth.LoginPendingError) as excinfo:
+        auth._local_callback_login(poll_seconds=1)
+    elapsed = auth.time.time() - start
+
+    assert elapsed < 5, "should raise quickly rather than blocking for a long time"
+    assert excinfo.value.url.startswith("http://127.0.0.1:")
+    assert excinfo.value.url in str(excinfo.value)
+
+
+def test_local_callback_login_retry_reuses_pending_server_and_succeeds(monkeypatch):
+    monkeypatch.setattr(auth, "_has_display", lambda: False)
+
+    # First call: nobody has logged in yet, so it raises quickly with a URL.
+    with pytest.raises(auth.LoginPendingError) as excinfo:
+        auth._local_callback_login(poll_seconds=1)
+    url = excinfo.value.url
+
+    # Simulate the user completing login via that same URL in the meantime.
+    fake_login_response = {
+        "access_token": "retry-jwt",
+        "refresh_token": "retry-refresh",
+        "expire_at": 1,
+        "expire_after": 2,
+    }
+    httpx.post(url + "callback", json=fake_login_response)
+
+    # Second call (the caller's retry): reuses the same server, sees the
+    # already-captured token immediately instead of starting a new one.
+    result = auth._local_callback_login(poll_seconds=5)
+
+    assert result == fake_login_response
+    assert auth._pending["server"] is None, "server should be cleaned up after success"
